@@ -1,4 +1,4 @@
-# 📅 Console Calendar Manager Pro 2.0
+# 📅 Console Calendar Manager
 
 A feature-rich, console-based calendar management application built in C. This project demonstrates advanced data structures (linked lists), file I/O operations, and a beautiful command-line interface with color-coded output.
 
