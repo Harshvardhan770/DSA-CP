@@ -1,3 +1,4 @@
+// gcc -o calendar.exe calendar_win32.c -mwindows -lcomctl32 -lgdi32
 #include <windows.h>
 #include <commctrl.h>
 #include <stdio.h>
