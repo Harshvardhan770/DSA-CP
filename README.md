@@ -46,7 +46,7 @@ This enhanced edition introduces modern event management features such as **sear
 ### Installation
 ### Installation
 
- **Direct Download** – [Click here](https://krushnansh22.github.io/DSA-CP/Calendar_setup.zip) 
+ **Direct Download** – [Click here](https://krushnansh22.github.io/DSA-CP/Calendar_Setup.zip) 
 **OR** 
 **Visit Website: https://krushnansh22.github.io/DSA-CP/**
 
