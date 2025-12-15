@@ -1,4 +1,4 @@
-// gcc -o calendar_win32.exe calendar_win32.c -mwindows -lcomctl32 -lgdi32
+// gcc -o calendar_enhanced.exe calendar_enhanced.c -mwindows -lcomctl32 -lgdi32
 #include <windows.h>
 #include <commctrl.h>
 #include <stdio.h>
@@ -8,11 +8,11 @@
 
 #pragma comment(lib, "comctl32.lib")
 
-// ========== CONSTANTS ==========
 #define MAX_DESC 200
 #define MAX_LOC 100
 #define DATA_FILE "calendar.dat"
 
+// Control IDs
 #define ID_CALENDAR 1001
 #define ID_ADD_BTN 1002
 #define ID_DELETE_BTN 1003
@@ -22,7 +22,13 @@
 #define ID_VIEW_TODAY 1007
 #define ID_EXPORT 1008
 #define ID_STATS 1009
-#define ID_TAB 1010
+#define ID_SEARCH 1010
+#define ID_SEARCH_BOX 1011
+#define ID_FILTER_CAT 1012
+#define ID_FILTER_PRI 1013
+#define ID_VIEW_DETAILS 1014
+#define ID_IMPORT 1015
+#define ID_BACKUP 1016
 
 // Dialog controls
 #define IDC_DESC 2001
@@ -34,13 +40,18 @@
 #define IDC_PRIORITY 2007
 #define IDC_CATEGORY 2008
 #define IDC_ALL_DAY 2009
-#define IDC_RECUR 2010
 #define IDC_REMINDER 2011
 #define IDC_REMINDER_MIN 2012
 #define IDC_SAVE 2013
 #define IDC_CANCEL 2014
 
-// ========== DATA STRUCTURES ==========
+// Keyboard shortcuts
+#define IDM_NEW 3001
+#define IDM_EDIT 3002
+#define IDM_DELETE 3003
+#define IDM_SEARCH 3004
+#define IDM_REFRESH 3005
+
 typedef enum {
     PRIORITY_LOW = 0, PRIORITY_MEDIUM, PRIORITY_HIGH, PRIORITY_CRITICAL
 } Priority;
@@ -50,9 +61,6 @@ typedef enum {
     CAT_APPOINTMENT, CAT_REMINDER, CAT_HOLIDAY, CAT_OTHER
 } Category;
 
-typedef enum {
-    RECUR_NONE, RECUR_DAILY, RECUR_WEEKLY, RECUR_MONTHLY, RECUR_YEARLY
-} RecurrenceType;
 
 typedef struct {
     int day, month, year;
@@ -71,21 +79,27 @@ typedef struct Event {
     Priority priority;
     Category category;
     int is_all_day;
-    RecurrenceType recurrence;
     int reminder_minutes;
     int deleted;
     struct Event *next;
 } Event;
 
-// ========== GLOBAL VARIABLES ==========
+// Global variables
 Event *event_list = NULL;
 int next_id = 1;
-HWND hwndMain, hwndCalendar, hwndListView, hwndStatus, hwndTab;
+HWND hwndMain, hwndCalendar, hwndListView, hwndStatus, hwndSearchBox;
 HWND hwndAddDialog = NULL;
 HINSTANCE hInst;
 Date g_selected_date;
+int g_edit_mode = 0;
+int g_edit_event_id = 0;
 
-// ========== UTILITY FUNCTIONS ==========
+// Filter state
+char g_search_filter[MAX_DESC] = "";
+int g_category_filter = -1; // -1 = all
+int g_priority_filter = -1; // -1 = all
+
+// Utility functions
 int is_leap_year(int year) {
     return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
 }
@@ -126,21 +140,35 @@ const char* category_to_string(Category c) {
     return cats[c];
 }
 
-const char* recurrence_to_string(RecurrenceType r) {
-    switch(r) {
-        case RECUR_NONE: return "None";
-        case RECUR_DAILY: return "Daily";
-        case RECUR_WEEKLY: return "Weekly";
-        case RECUR_MONTHLY: return "Monthly";
-        case RECUR_YEARLY: return "Yearly";
-        default: return "None";
+
+COLORREF get_priority_color(Priority p) {
+    switch(p) {
+        case PRIORITY_CRITICAL: return RGB(255, 200, 200);
+        case PRIORITY_HIGH: return RGB(255, 230, 200);
+        case PRIORITY_MEDIUM: return RGB(255, 255, 200);
+        case PRIORITY_LOW: return RGB(200, 255, 200);
+        default: return RGB(255, 255, 255);
     }
 }
 
-// ========== EVENT MANAGEMENT ==========
+COLORREF get_category_color(Category c) {
+    switch(c) {
+        case CAT_WORK: return RGB(200, 220, 255);
+        case CAT_PERSONAL: return RGB(220, 255, 220);
+        case CAT_BIRTHDAY: return RGB(255, 200, 255);
+        case CAT_MEETING: return RGB(255, 240, 200);
+        case CAT_APPOINTMENT: return RGB(220, 240, 255);
+        case CAT_REMINDER: return RGB(255, 255, 220);
+        case CAT_HOLIDAY: return RGB(255, 220, 220);
+        case CAT_OTHER: return RGB(240, 240, 240);
+        default: return RGB(255, 255, 255);
+    }
+}
+
+// Event management
 Event* create_event(Date date, Time start, Time end, const char *desc,
                    const char *loc, Priority pri, Category cat,
-                   int all_day, RecurrenceType rec, int reminder) {
+                   int all_day, int reminder) {
     Event *e = (Event*)malloc(sizeof(Event));
     if (!e) return NULL;
     
@@ -155,7 +183,6 @@ Event* create_event(Date date, Time start, Time end, const char *desc,
     e->priority = pri;
     e->category = cat;
     e->is_all_day = all_day;
-    e->recurrence = rec;
     e->reminder_minutes = reminder;
     e->deleted = 0;
     e->next = NULL;
@@ -187,7 +214,18 @@ void delete_event(int id) {
     if (e) e->deleted = 1;
 }
 
-// ========== FILE OPERATIONS ==========
+int has_events_on_date(Date d) {
+    Event *e = event_list;
+    while (e) {
+        if (!e->deleted && compare_dates(e->date, d) == 0) {
+            return 1;
+        }
+        e = e->next;
+    }
+    return 0;
+}
+
+// File I/O
 void save_events() {
     FILE *fp = fopen(DATA_FILE, "wb");
     if (!fp) return;
@@ -238,11 +276,42 @@ void load_events() {
     fclose(fp);
 }
 
+void backup_data() {
+    char filename[MAX_PATH];
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    sprintf(filename, "calendar_backup_%04d%02d%02d_%02d%02d%02d.dat",
+            t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+            t->tm_hour, t->tm_min, t->tm_sec);
+    
+    FILE *src = fopen(DATA_FILE, "rb");
+    if (!src) return;
+    
+    FILE *dst = fopen(filename, "wb");
+    if (!dst) {
+        fclose(src);
+        return;
+    }
+    
+    char buffer[4096];
+    size_t bytes;
+    while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
+        fwrite(buffer, 1, bytes, dst);
+    }
+    
+    fclose(src);
+    fclose(dst);
+    
+    char msg[500];
+    sprintf(msg, "Backup created successfully:\n%s", filename);
+    MessageBox(hwndMain, msg, "Backup Complete", MB_OK | MB_ICONINFORMATION);
+}
+
 void export_to_csv(const char *filename) {
     FILE *fp = fopen(filename, "w");
     if (!fp) return;
     
-    fprintf(fp, "ID,Date,Time,Description,Location,Priority,Category,Recurrence\n");
+    fprintf(fp, "ID,Date,Time,Description,Location,Priority,Category,Reminder\n");
     
     Event *e = event_list;
     while (e) {
@@ -255,18 +324,18 @@ void export_to_csv(const char *filename) {
                        e->start_time.hour, e->start_time.minute,
                        e->end_time.hour, e->end_time.minute);
             }
-            fprintf(fp, "\"%s\",\"%s\",%s,%s,%s\n",
+            fprintf(fp, "\"%s\",\"%s\",%s,%s,%d min\n",
                    e->description, e->location,
                    priority_to_string(e->priority),
                    category_to_string(e->category),
-                   recurrence_to_string(e->recurrence));
+                   e->reminder_minutes);
         }
         e = e->next;
     }
     fclose(fp);
 }
 
-// ========== GUI FUNCTIONS ==========
+// UI Functions
 void update_list_view(Date *filter_date) {
     ListView_DeleteAllItems(hwndListView);
     
@@ -276,20 +345,58 @@ void update_list_view(Date *filter_date) {
     
     while (e) {
         if (!e->deleted) {
-            if (!filter_date || compare_dates(e->date, *filter_date) == 0) {
+            int show = 1;
+            
+            // Apply date filter
+            if (filter_date && compare_dates(e->date, *filter_date) != 0) {
+                show = 0;
+            }
+            
+            // Apply search filter
+            if (show && strlen(g_search_filter) > 0) {
+                char desc_lower[MAX_DESC], search_lower[MAX_DESC];
+                strcpy(desc_lower, e->description);
+                strcpy(search_lower, g_search_filter);
+                _strlwr(desc_lower);
+                _strlwr(search_lower);
+                if (strstr(desc_lower, search_lower) == NULL) {
+                    show = 0;
+                }
+            }
+            
+            // Apply category filter
+            if (show && g_category_filter != -1 && e->category != g_category_filter) {
+                show = 0;
+            }
+            
+            // Apply priority filter
+            if (show && g_priority_filter != -1 && e->priority != g_priority_filter) {
+                show = 0;
+            }
+            
+            if (show) {
                 LVITEM lvi = {0};
+                char buffer[50];
+                
+                // Column 0: ID
                 lvi.mask = LVIF_TEXT | LVIF_PARAM;
                 lvi.iItem = idx;
+                lvi.iSubItem = 0;
                 lvi.lParam = (LPARAM)e->id;
-                
-                char buffer[50];
                 sprintf(buffer, "%d", e->id);
                 lvi.pszText = buffer;
-                ListView_InsertItem(hwndListView, &lvi);
+                int item_idx = ListView_InsertItem(hwndListView, &lvi);
                 
+                if (item_idx == -1) {
+                    MessageBox(hwndMain, "Failed to insert item!", "Debug", MB_OK);
+                    continue;
+                }
+                
+                // Date
                 sprintf(buffer, "%02d/%02d/%d", e->date.day, e->date.month, e->date.year);
-                ListView_SetItemText(hwndListView, idx, 1, buffer);
+                ListView_SetItemText(hwndListView, item_idx, 1, buffer);
                 
+                // Time
                 if (e->is_all_day) {
                     strcpy(buffer, "All Day");
                 } else {
@@ -297,11 +404,19 @@ void update_list_view(Date *filter_date) {
                            e->start_time.hour, e->start_time.minute,
                            e->end_time.hour, e->end_time.minute);
                 }
-                ListView_SetItemText(hwndListView, idx, 2, buffer);
+                ListView_SetItemText(hwndListView, item_idx, 2, buffer);
                 
-                ListView_SetItemText(hwndListView, idx, 3, e->description);
-                ListView_SetItemText(hwndListView, idx, 4, (char*)priority_to_string(e->priority));
-                ListView_SetItemText(hwndListView, idx, 5, (char*)category_to_string(e->category));
+                // Description
+                ListView_SetItemText(hwndListView, item_idx, 3, e->description);
+                
+                // Location
+                ListView_SetItemText(hwndListView, item_idx, 4, e->location);
+                
+                // Priority
+                ListView_SetItemText(hwndListView, item_idx, 5, (char*)priority_to_string(e->priority));
+                
+                // Category
+                ListView_SetItemText(hwndListView, item_idx, 6, (char*)category_to_string(e->category));
                 
                 idx++;
             }
@@ -313,16 +428,111 @@ void update_list_view(Date *filter_date) {
     char status[100];
     sprintf(status, "Total Events: %d | Showing: %d", total, idx);
     SetWindowText(hwndStatus, status);
+    
+    // Force redraw
+    InvalidateRect(hwndListView, NULL, TRUE);
+    UpdateWindow(hwndListView);
 }
 
-void mark_calendar_dates() {
-    // Note: Windows MonthCalendar doesn't support marking individual days easily
-    // This would require MCN_GETDAYSTATE notification handler
+void debug_print_events() {
+    int count = 0;
+    Event *e = event_list;
+    char msg[1000] = "Events in memory:\n\n";
+    
+    while (e && count < 5) {  // Show first 5 events
+        if (!e->deleted) {
+            char temp[200];
+            sprintf(temp, "ID:%d - %s (%02d/%02d/%d)\n", 
+                   e->id, e->description, e->date.day, e->date.month, e->date.year);
+            strcat(msg, temp);
+            count++;
+        }
+        e = e->next;
+    }
+    
+    if (count == 0) {
+        strcat(msg, "NO EVENTS FOUND!\n");
+    }
+    
+    MessageBox(hwndMain, msg, "Debug: Events", MB_OK);
 }
 
-// ========== ADD EVENT DIALOG PROCEDURE ==========
+void show_event_details(int event_id) {
+    Event *e = find_event_by_id(event_id);
+    if (!e) return;
+    
+    char details[2000];
+    char time_str[100];
+    
+    if (e->is_all_day) {
+        strcpy(time_str, "All Day");
+    } else {
+        sprintf(time_str, "%02d:%02d - %02d:%02d", 
+               e->start_time.hour, e->start_time.minute,
+               e->end_time.hour, e->end_time.minute);
+    }
+    
+    sprintf(details,
+           "===================================\n"
+           "           EVENT DETAILS\n"
+           "===================================\n\n"
+           "ID: %d\n"
+           "Description: %s\n"
+           "Location: %s\n\n"
+           "Date: %02d/%02d/%d\n"
+           "Time: %s\n\n"
+           "Priority: %s\n"
+           "Category: %s\n\n"
+           "%s"
+           "===================================",
+           e->id, e->description, 
+           strlen(e->location) > 0 ? e->location : "(No location)",
+           e->date.day, e->date.month, e->date.year,
+           time_str,
+           priority_to_string(e->priority),
+           category_to_string(e->category),
+           e->reminder_minutes > 0 ? 
+               "Reminder: Set\n\n" : "");
+    
+    MessageBox(hwndMain, details, "Event Details", MB_OK | MB_ICONINFORMATION);
+}
+
+// Add/Edit Event Dialog
 LRESULT CALLBACK AddEventDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_INITDIALOG: {
+            // If editing, populate fields
+            if (g_edit_mode) {
+                Event *e = find_event_by_id(g_edit_event_id);
+                if (e) {
+                    SetDlgItemText(hwnd, IDC_DESC, e->description);
+                    SetDlgItemText(hwnd, IDC_LOC, e->location);
+                    SetDlgItemInt(hwnd, IDC_HOUR, e->start_time.hour, FALSE);
+                    SetDlgItemInt(hwnd, IDC_MIN, e->start_time.minute, FALSE);
+                    SetDlgItemInt(hwnd, IDC_END_HOUR, e->end_time.hour, FALSE);
+                    SetDlgItemInt(hwnd, IDC_END_MIN, e->end_time.minute, FALSE);
+                    
+                    CheckDlgButton(hwnd, IDC_ALL_DAY, e->is_all_day ? BST_CHECKED : BST_UNCHECKED);
+                    SendDlgItemMessage(hwnd, IDC_PRIORITY, CB_SETCURSEL, e->priority, 0);
+                    SendDlgItemMessage(hwnd, IDC_CATEGORY, CB_SETCURSEL, e->category, 0);
+                    
+                    if (e->reminder_minutes > 0) {
+                        CheckDlgButton(hwnd, IDC_REMINDER, BST_CHECKED);
+                        SetDlgItemInt(hwnd, IDC_REMINDER_MIN, e->reminder_minutes, FALSE);
+                        EnableWindow(GetDlgItem(hwnd, IDC_REMINDER_MIN), TRUE);
+                    }
+                    
+                    if (e->is_all_day) {
+                        EnableWindow(GetDlgItem(hwnd, IDC_HOUR), FALSE);
+                        EnableWindow(GetDlgItem(hwnd, IDC_MIN), FALSE);
+                        EnableWindow(GetDlgItem(hwnd, IDC_END_HOUR), FALSE);
+                        EnableWindow(GetDlgItem(hwnd, IDC_END_MIN), FALSE);
+                    }
+                }
+            }
+            return TRUE;
+        }
+        
         case WM_COMMAND: {
             switch (LOWORD(wParam)) {
                 case IDC_ALL_DAY: {
@@ -359,31 +569,69 @@ LRESULT CALLBACK AddEventDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                         GetDlgItemInt(hwnd, IDC_END_MIN, NULL, FALSE)
                     };
                     
+                    // Validate times
+                    if (start.hour > 23 || start.minute > 59 || end.hour > 23 || end.minute > 59) {
+                        MessageBox(hwnd, "Invalid time! Hours: 0-23, Minutes: 0-59", "Error", MB_OK | MB_ICONERROR);
+                        return 0;
+                    }
+                    
                     int all_day = IsDlgButtonChecked(hwnd, IDC_ALL_DAY);
+                    if (!all_day && (start.hour * 60 + start.minute >= end.hour * 60 + end.minute)) {
+                        MessageBox(hwnd, "End time must be after start time!", "Error", MB_OK | MB_ICONERROR);
+                        return 0;
+                    }
+                    
                     Priority pri = (Priority)SendDlgItemMessage(hwnd, IDC_PRIORITY, CB_GETCURSEL, 0, 0);
                     Category cat = (Category)SendDlgItemMessage(hwnd, IDC_CATEGORY, CB_GETCURSEL, 0, 0);
-                    RecurrenceType rec = (RecurrenceType)SendDlgItemMessage(hwnd, IDC_RECUR, CB_GETCURSEL, 0, 0);
                     
                     int reminder = 0;
                     if (IsDlgButtonChecked(hwnd, IDC_REMINDER)) {
                         reminder = GetDlgItemInt(hwnd, IDC_REMINDER_MIN, NULL, FALSE);
                     }
                     
-                    Event *e = create_event(g_selected_date, start, end, desc, loc, pri, cat, all_day, rec, reminder);
-                    if (e) {
-                        add_event_to_list(e);
-                        save_events();
-                        update_list_view(NULL);
-                        SetWindowText(hwndStatus, "Event added successfully!");
-                        DestroyWindow(hwnd);
-                        hwndAddDialog = NULL;
+                    if (g_edit_mode) {
+                        // Edit existing event
+                        Event *e = find_event_by_id(g_edit_event_id);
+                        if (e) {
+                            e->date = g_selected_date;
+                            e->start_time = start;
+                            e->end_time = end;
+                            strncpy(e->description, desc, MAX_DESC-1);
+                            e->description[MAX_DESC-1] = '\0';
+                            strncpy(e->location, loc, MAX_LOC-1);
+                            e->location[MAX_LOC-1] = '\0';
+                            e->priority = pri;
+                            e->category = cat;
+                            e->is_all_day = all_day;
+                            e->reminder_minutes = reminder;
+                            
+                            save_events();
+                            update_list_view(NULL);
+                            SetWindowText(hwndStatus, "Event updated successfully!");
+                        }
+                    } else {
+                        // Create new event 
+                        Event *e = create_event(g_selected_date, start, end, desc, loc, pri, cat, all_day, reminder);
+                        if (e) {
+                            add_event_to_list(e);
+                            save_events();
+                            update_list_view(NULL);
+                            SetWindowText(hwndStatus, "Event added successfully!");
+                        }
                     }
+                    
+                    DestroyWindow(hwnd);
+                    hwndAddDialog = NULL;
+                    g_edit_mode = 0;
+                    g_edit_event_id = 0;
                     return 0;
                 }
                 
                 case IDC_CANCEL: {
                     DestroyWindow(hwnd);
                     hwndAddDialog = NULL;
+                    g_edit_mode = 0;
+                    g_edit_event_id = 0;
                     return 0;
                 }
             }
@@ -393,11 +641,8 @@ LRESULT CALLBACK AddEventDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         case WM_CLOSE: {
             DestroyWindow(hwnd);
             hwndAddDialog = NULL;
-            return 0;
-        }
-        
-        case WM_DESTROY: {
-            hwndAddDialog = NULL;
+            g_edit_mode = 0;
+            g_edit_event_id = 0;
             return 0;
         }
     }
@@ -405,13 +650,15 @@ LRESULT CALLBACK AddEventDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-void show_add_event_dialog(HWND parent) {
+void show_add_edit_event_dialog(HWND parent, int edit_mode, int event_id) {
     if (hwndAddDialog) {
         SetForegroundWindow(hwndAddDialog);
         return;
     }
     
-    // Register dialog window class
+    g_edit_mode = edit_mode;
+    g_edit_event_id = event_id;
+    
     static int registered = 0;
     if (!registered) {
         WNDCLASSEX wc = {0};
@@ -425,45 +672,46 @@ void show_add_event_dialog(HWND parent) {
         registered = 1;
     }
     
-    // Get selected date from calendar
-    SYSTEMTIME st;
-    MonthCal_GetCurSel(hwndCalendar, &st);
-    g_selected_date.day = st.wDay;
-    g_selected_date.month = st.wMonth;
-    g_selected_date.year = st.wYear;
+    if (!edit_mode) {
+        SYSTEMTIME st;
+        MonthCal_GetCurSel(hwndCalendar, &st);
+        g_selected_date.day = st.wDay;
+        g_selected_date.month = st.wMonth;
+        g_selected_date.year = st.wYear;
+    } else {
+        Event *e = find_event_by_id(event_id);
+        if (e) {
+            g_selected_date = e->date;
+        }
+    }
     
-    // Create dialog window
     hwndAddDialog = CreateWindowEx(
         WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
         "AddEventDialog",
-        "Add New Event",
+        edit_mode ? "Edit Event" : "Add New Event",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 480, 580,
+        CW_USEDEFAULT, CW_USEDEFAULT, 480, 540,
         parent, NULL, hInst, NULL
     );
     
     int y = 15;
     
-    // Description
     CreateWindow("STATIC", "Description:", WS_CHILD | WS_VISIBLE,
                 15, y, 100, 20, hwndAddDialog, NULL, hInst, NULL);
     CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
                   125, y, 330, 25, hwndAddDialog, (HMENU)IDC_DESC, hInst, NULL);
     y += 35;
     
-    // Location
     CreateWindow("STATIC", "Location:", WS_CHILD | WS_VISIBLE,
                 15, y, 100, 20, hwndAddDialog, NULL, hInst, NULL);
     CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
                   125, y, 330, 25, hwndAddDialog, (HMENU)IDC_LOC, hInst, NULL);
     y += 40;
     
-    // All Day checkbox
     CreateWindow("BUTTON", "All Day Event", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
                 15, y, 150, 25, hwndAddDialog, (HMENU)IDC_ALL_DAY, hInst, NULL);
     y += 35;
     
-    // Start Time
     CreateWindow("STATIC", "Start Time (HH:MM):", WS_CHILD | WS_VISIBLE,
                 15, y, 110, 20, hwndAddDialog, NULL, hInst, NULL);
     CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "9", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_NUMBER,
@@ -474,7 +722,6 @@ void show_add_event_dialog(HWND parent) {
                   205, y, 50, 25, hwndAddDialog, (HMENU)IDC_MIN, hInst, NULL);
     y += 35;
     
-    // End Time
     CreateWindow("STATIC", "End Time (HH:MM):", WS_CHILD | WS_VISIBLE,
                 15, y, 110, 20, hwndAddDialog, NULL, hInst, NULL);
     CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "10", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_NUMBER,
@@ -485,7 +732,6 @@ void show_add_event_dialog(HWND parent) {
                   205, y, 50, 25, hwndAddDialog, (HMENU)IDC_END_MIN, hInst, NULL);
     y += 40;
     
-    // Priority
     CreateWindow("STATIC", "Priority:", WS_CHILD | WS_VISIBLE,
                 15, y, 100, 20, hwndAddDialog, NULL, hInst, NULL);
     HWND hwndPriority = CreateWindow("COMBOBOX", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
@@ -497,7 +743,6 @@ void show_add_event_dialog(HWND parent) {
     SendMessage(hwndPriority, CB_SETCURSEL, 1, 0);
     y += 35;
     
-    // Category
     CreateWindow("STATIC", "Category:", WS_CHILD | WS_VISIBLE,
                 15, y, 100, 20, hwndAddDialog, NULL, hInst, NULL);
     HWND hwndCategory = CreateWindow("COMBOBOX", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
@@ -513,57 +758,91 @@ void show_add_event_dialog(HWND parent) {
     SendMessage(hwndCategory, CB_SETCURSEL, 0, 0);
     y += 35;
     
-    // Recurrence
-    CreateWindow("STATIC", "Recurrence:", WS_CHILD | WS_VISIBLE,
-                15, y, 100, 20, hwndAddDialog, NULL, hInst, NULL);
-    HWND hwndRecur = CreateWindow("COMBOBOX", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
-                                  125, y, 150, 200, hwndAddDialog, (HMENU)IDC_RECUR, hInst, NULL);
-    SendMessage(hwndRecur, CB_ADDSTRING, 0, (LPARAM)"None");
-    SendMessage(hwndRecur, CB_ADDSTRING, 0, (LPARAM)"Daily");
-    SendMessage(hwndRecur, CB_ADDSTRING, 0, (LPARAM)"Weekly");
-    SendMessage(hwndRecur, CB_ADDSTRING, 0, (LPARAM)"Monthly");
-    SendMessage(hwndRecur, CB_ADDSTRING, 0, (LPARAM)"Yearly");
-    SendMessage(hwndRecur, CB_SETCURSEL, 0, 0);
-    y += 40;
     
-    // Reminder
     CreateWindow("BUTTON", "Set Reminder", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
                 15, y, 120, 25, hwndAddDialog, (HMENU)IDC_REMINDER, hInst, NULL);
     HWND hwndReminderMin = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "15", 
-                                          WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_NUMBER,
-                                          145, y, 60, 25, hwndAddDialog, (HMENU)IDC_REMINDER_MIN, hInst, NULL);
+                                         WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_NUMBER,
+                                         145, y, 60, 25, hwndAddDialog, (HMENU)IDC_REMINDER_MIN, hInst, NULL);
     EnableWindow(hwndReminderMin, FALSE);
     CreateWindow("STATIC", "minutes before", WS_CHILD | WS_VISIBLE,
                 210, y+3, 100, 20, hwndAddDialog, NULL, hInst, NULL);
     y += 50;
     
-    // Buttons
-    CreateWindow("BUTTON", "Save Event", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
+    CreateWindow("BUTTON", edit_mode ? "Update Event" : "Save Event", 
+                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
                 100, y, 120, 35, hwndAddDialog, (HMENU)IDC_SAVE, hInst, NULL);
     CreateWindow("BUTTON", "Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
                 240, y, 120, 35, hwndAddDialog, (HMENU)IDC_CANCEL, hInst, NULL);
     
-    // Set focus to description field
     SetFocus(GetDlgItem(hwndAddDialog, IDC_DESC));
+    
+    if (edit_mode) {
+        SendMessage(hwndAddDialog, WM_INITDIALOG, 0, 0);
+    }
 }
 
-// ========== MAIN WINDOW PROCEDURE ==========
+// Main Window Procedure
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
-            // Create calendar control
+            
+            HFONT hFont = CreateFont(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                    CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
+            
+            // Calendar
             hwndCalendar = CreateWindowEx(0, MONTHCAL_CLASS, "",
-                                         WS_CHILD | WS_VISIBLE | WS_BORDER,
+                                         WS_CHILD | WS_VISIBLE | WS_BORDER | MCS_DAYSTATE,
                                          20, 20, 300, 300,
                                          hwnd, (HMENU)ID_CALENDAR, hInst, NULL);
             
-            // Create list view
+            // Search controls
+            CreateWindow("STATIC", "Search:", WS_CHILD | WS_VISIBLE,
+                        340, 25, 60, 25, hwnd, NULL, hInst, NULL);
+            hwndSearchBox = CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "",
+                                          WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                                          405, 22, 250, 25, hwnd, (HMENU)ID_SEARCH_BOX, hInst, NULL);
+            SendMessage(hwndSearchBox, WM_SETFONT, (WPARAM)hFont, TRUE);
+            
+            CreateWindow("BUTTON", "Search", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                        665, 20, 80, 30, hwnd, (HMENU)ID_SEARCH, hInst, NULL);
+            
+            // Filter Category
+            CreateWindow("STATIC", "Category:", WS_CHILD | WS_VISIBLE,
+                        760, 25, 70, 25, hwnd, NULL, hInst, NULL);
+            HWND hwndFilterCat = CreateWindow("COMBOBOX", "", 
+                                             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
+                                             835, 22, 150, 200, hwnd, (HMENU)ID_FILTER_CAT, hInst, NULL);
+            SendMessage(hwndFilterCat, CB_ADDSTRING, 0, (LPARAM)"All Categories");
+            SendMessage(hwndFilterCat, CB_ADDSTRING, 0, (LPARAM)"Work");
+            SendMessage(hwndFilterCat, CB_ADDSTRING, 0, (LPARAM)"Personal");
+            SendMessage(hwndFilterCat, CB_ADDSTRING, 0, (LPARAM)"Birthday");
+            SendMessage(hwndFilterCat, CB_ADDSTRING, 0, (LPARAM)"Meeting");
+            SendMessage(hwndFilterCat, CB_ADDSTRING, 0, (LPARAM)"Appointment");
+            SendMessage(hwndFilterCat, CB_ADDSTRING, 0, (LPARAM)"Reminder");
+            SendMessage(hwndFilterCat, CB_ADDSTRING, 0, (LPARAM)"Holiday");
+            SendMessage(hwndFilterCat, CB_ADDSTRING, 0, (LPARAM)"Other");
+            SendMessage(hwndFilterCat, CB_SETCURSEL, 0, 0);
+            
+            // Filter Priority
+            CreateWindow("STATIC", "Priority:", WS_CHILD | WS_VISIBLE,
+                        1000, 25, 60, 25, hwnd, NULL, hInst, NULL);
+            HWND hwndFilterPri = CreateWindow("COMBOBOX", "",
+                                             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
+                                             1065, 22, 120, 200, hwnd, (HMENU)ID_FILTER_PRI, hInst, NULL);
+            SendMessage(hwndFilterPri, CB_ADDSTRING, 0, (LPARAM)"All Priorities");
+            SendMessage(hwndFilterPri, CB_ADDSTRING, 0, (LPARAM)"Low");
+            SendMessage(hwndFilterPri, CB_ADDSTRING, 0, (LPARAM)"Medium");
+            SendMessage(hwndFilterPri, CB_ADDSTRING, 0, (LPARAM)"High");
+            SendMessage(hwndFilterPri, CB_ADDSTRING, 0, (LPARAM)"Critical");
+            SendMessage(hwndFilterPri, CB_SETCURSEL, 0, 0);
+            // List View
             hwndListView = CreateWindowEx(WS_EX_CLIENTEDGE, WC_LISTVIEW, "",
                                          WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
-                                         340, 20, 820, 520,
+                                         340, 60, 850, 480,
                                          hwnd, (HMENU)ID_LIST, hInst, NULL);
             
-            // Setup list view columns
             LVCOLUMN lvc = {0};
             lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
             
@@ -576,60 +855,104 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ListView_InsertColumn(hwndListView, 1, &lvc);
             
             lvc.pszText = "Time";
-            lvc.cx = 120;
+            lvc.cx = 110;
             ListView_InsertColumn(hwndListView, 2, &lvc);
             
             lvc.pszText = "Description";
-            lvc.cx = 280;
+            lvc.cx = 250;
             ListView_InsertColumn(hwndListView, 3, &lvc);
+            
+            lvc.pszText = "Location";
+            lvc.cx = 130;
+            ListView_InsertColumn(hwndListView, 4, &lvc);
             
             lvc.pszText = "Priority";
             lvc.cx = 80;
-            ListView_InsertColumn(hwndListView, 4, &lvc);
+            ListView_InsertColumn(hwndListView, 5, &lvc);
             
             lvc.pszText = "Category";
             lvc.cx = 100;
-            ListView_InsertColumn(hwndListView, 5, &lvc);
+            ListView_InsertColumn(hwndListView, 6, &lvc);
             
-            // Set extended list view styles
+
             ListView_SetExtendedListViewStyle(hwndListView, 
                 LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
             
-            // Create buttons
+            // Buttons 
+            int btn_y = 340;
+            int btn_w = 140;
+            int btn_h = 35;
+            int btn_spacing = 10;
+            
             CreateWindow("BUTTON", "Add Event", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                        20, 340, 140, 35, hwnd, (HMENU)ID_ADD_BTN, hInst, NULL);
+                        20, btn_y, btn_w, btn_h, hwnd, (HMENU)ID_ADD_BTN, hInst, NULL);
+            
+            CreateWindow("BUTTON", "Edit Event", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                        170, btn_y, btn_w, btn_h, hwnd, (HMENU)ID_EDIT_BTN, hInst, NULL);
+            
+            btn_y += btn_h + btn_spacing;
             
             CreateWindow("BUTTON", "Delete Event", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                        170, 340, 140, 35, hwnd, (HMENU)ID_DELETE_BTN, hInst, NULL);
+                        20, btn_y, btn_w, btn_h, hwnd, (HMENU)ID_DELETE_BTN, hInst, NULL);
+            
+            CreateWindow("BUTTON", "View Details", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                        170, btn_y, btn_w, btn_h, hwnd, (HMENU)ID_VIEW_DETAILS, hInst, NULL);
+            
+            btn_y += btn_h + btn_spacing;
             
             CreateWindow("BUTTON", "View Today", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                        20, 385, 140, 35, hwnd, (HMENU)ID_VIEW_TODAY, hInst, NULL);
+                        20, btn_y, btn_w, btn_h, hwnd, (HMENU)ID_VIEW_TODAY, hInst, NULL);
             
             CreateWindow("BUTTON", "View All", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                        170, 385, 140, 35, hwnd, (HMENU)ID_VIEW_ALL, hInst, NULL);
+                        170, btn_y, btn_w, btn_h, hwnd, (HMENU)ID_VIEW_ALL, hInst, NULL);
+            
+            btn_y += btn_h + btn_spacing;
             
             CreateWindow("BUTTON", "Export CSV", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                        20, 430, 140, 35, hwnd, (HMENU)ID_EXPORT, hInst, NULL);
+                        20, btn_y, btn_w, btn_h, hwnd, (HMENU)ID_EXPORT, hInst, NULL);
+            
+            CreateWindow("BUTTON", "Backup", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                        170, btn_y, btn_w, btn_h, hwnd, (HMENU)ID_BACKUP, hInst, NULL);
+            
+            btn_y += btn_h + btn_spacing;
             
             CreateWindow("BUTTON", "Statistics", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                        170, 430, 140, 35, hwnd, (HMENU)ID_STATS, hInst, NULL);
+                        20, btn_y, (btn_w * 2) + btn_spacing, btn_h, hwnd, (HMENU)ID_STATS, hInst, NULL);
+
+            CreateWindow("BUTTON", "Debug", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                        20, btn_y + 50, 290, 35, hwnd, (HMENU)9999, hInst, NULL);
             
-            // Create status bar
-            hwndStatus = CreateWindowEx(0, STATUSCLASSNAME, "Ready - Calendar Manager Pro",
+            // Status bar
+            hwndStatus = CreateWindowEx(0, STATUSCLASSNAME, "Ready",
                                        WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
-                                       0, 0, 0, 0,
-                                       hwnd, NULL, hInst, NULL);
+                                       0, 0, 0, 0, hwnd, NULL, hInst, NULL);
             
-            // Load events
+
             load_events();
+            
+            // Debug output
+            int count = 0;
+            Event *e = event_list;
+            while (e) {
+                if (!e->deleted) count++;
+                e = e->next;
+            }
+            
+            char status[200];
+            sprintf(status, "Loaded %d events. Ready.", count);
+            SetWindowText(hwndStatus, status);
+            
+            // NOW update the list view
             update_list_view(NULL);
             
             return 0;
         }
         
+        // UPDATED: Completely replaced WM_NOTIFY to fix display blocking
         case WM_NOTIFY: {
             LPNMHDR nmhdr = (LPNMHDR)lParam;
             
+            // Calendar selection
             if (nmhdr->idFrom == ID_CALENDAR && nmhdr->code == MCN_SELECT) {
                 LPNMSELCHANGE pSelChange = (LPNMSELCHANGE)lParam;
                 Date selected = {
@@ -643,6 +966,64 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 sprintf(status, "Showing events for %02d/%02d/%d", 
                        selected.day, selected.month, selected.year);
                 SetWindowText(hwndStatus, status);
+                return 0;
+            }
+            
+            // Double-click calendar to add event
+            if (nmhdr->idFrom == ID_CALENDAR && nmhdr->code == NM_DBLCLK) {
+                show_add_edit_event_dialog(hwnd, 0, 0);
+                return 0;
+            }
+            
+            // Double-click list to view details
+            if (nmhdr->idFrom == ID_LIST && nmhdr->code == NM_DBLCLK) {
+                int idx = ListView_GetNextItem(hwndListView, -1, LVNI_SELECTED);
+                if (idx != -1) {
+                    LVITEM lvi = {0};
+                    lvi.mask = LVIF_PARAM;
+                    lvi.iItem = idx;
+                    ListView_GetItem(hwndListView, &lvi);
+                    show_event_details((int)lvi.lParam);
+                }
+                return 0;
+            }
+            
+            // Column sorting
+            if (nmhdr->idFrom == ID_LIST && nmhdr->code == LVN_COLUMNCLICK) {
+                update_list_view(NULL);
+                return 0;
+            }
+            
+            // Custom draw for colors
+            if (nmhdr->idFrom == ID_LIST && nmhdr->code == NM_CUSTOMDRAW) {
+                LPNMLVCUSTOMDRAW lplvcd = (LPNMLVCUSTOMDRAW)lParam;
+                
+                switch(lplvcd->nmcd.dwDrawStage) {
+                    case CDDS_PREPAINT:
+                        return CDRF_NOTIFYITEMDRAW;
+                        
+                    case CDDS_ITEMPREPAINT: {
+                        // Get the event ID from lParam
+                        LVITEM lvi = {0};
+                        lvi.mask = LVIF_PARAM;
+                        lvi.iItem = (int)lplvcd->nmcd.dwItemSpec;
+                        ListView_GetItem(hwndListView, &lvi);
+                        
+                        int event_id = (int)lvi.lParam;
+                        Event *e = find_event_by_id(event_id);
+                        
+                        if (e) {
+                            // Set background color based on priority
+                            lplvcd->clrTextBk = get_priority_color(e->priority);
+                            lplvcd->clrText = RGB(0, 0, 0); 
+                        }
+                        
+                        return CDRF_NEWFONT;
+                    }
+                    
+                    default:
+                        return CDRF_DODEFAULT;
+                }
             }
             
             return 0;
@@ -650,12 +1031,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         
         case WM_COMMAND: {
             switch (LOWORD(wParam)) {
-                case ID_ADD_BTN: {
-                    show_add_event_dialog(hwnd);
+                case ID_ADD_BTN:
+                case IDM_NEW: {
+                    show_add_edit_event_dialog(hwnd, 0, 0);
                     break;
                 }
                 
-                case ID_DELETE_BTN: {
+                case ID_EDIT_BTN:
+                case IDM_EDIT: {
+                    int idx = ListView_GetNextItem(hwndListView, -1, LVNI_SELECTED);
+                    if (idx != -1) {
+                        LVITEM lvi = {0};
+                        lvi.mask = LVIF_PARAM;
+                        lvi.iItem = idx;
+                        ListView_GetItem(hwndListView, &lvi);
+                        show_add_edit_event_dialog(hwnd, 1, (int)lvi.lParam);
+                    } else {
+                        MessageBox(hwnd, "Please select an event to edit.", 
+                                 "No Selection", MB_OK | MB_ICONINFORMATION);
+                    }
+                    break;
+                }
+                
+                case ID_DELETE_BTN:
+                case IDM_DELETE: {
                     int idx = ListView_GetNextItem(hwndListView, -1, LVNI_SELECTED);
                     if (idx != -1) {
                         LVITEM lvi = {0};
@@ -668,25 +1067,34 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         
                         if (e) {
                             char msg[400];
-                            sprintf(msg, "Are you sure you want to delete this event?\n\n"
-                                        "Description: %s\nDate: %02d/%02d/%d\n"
-                                        "Priority: %s\nCategory: %s",
-                                   e->description, e->date.day, e->date.month, e->date.year,
-                                   priority_to_string(e->priority),
-                                   category_to_string(e->category));
+                            sprintf(msg, "Delete this event?\n\n%s\n%02d/%02d/%d",
+                                   e->description, e->date.day, e->date.month, e->date.year);
                             
-                            int result = MessageBox(hwnd, msg, "Confirm Delete",
-                                                   MB_YESNO | MB_ICONQUESTION);
-                            
-                            if (result == IDYES) {
+                            if (MessageBox(hwnd, msg, "Confirm Delete",
+                                          MB_YESNO | MB_ICONQUESTION) == IDYES) {
                                 delete_event(id);
                                 save_events();
                                 update_list_view(NULL);
-                                SetWindowText(hwndStatus, "Event deleted successfully!");
+                                SetWindowText(hwndStatus, "Event deleted!");
                             }
                         }
                     } else {
-                        MessageBox(hwnd, "Please select an event from the list to delete.",
+                        MessageBox(hwnd, "Please select an event to delete.",
+                                 "No Selection", MB_OK | MB_ICONINFORMATION);
+                    }
+                    break;
+                }
+                
+                case ID_VIEW_DETAILS: {
+                    int idx = ListView_GetNextItem(hwndListView, -1, LVNI_SELECTED);
+                    if (idx != -1) {
+                        LVITEM lvi = {0};
+                        lvi.mask = LVIF_PARAM;
+                        lvi.iItem = idx;
+                        ListView_GetItem(hwndListView, &lvi);
+                        show_event_details((int)lvi.lParam);
+                    } else {
+                        MessageBox(hwnd, "Please select an event to view details.",
                                  "No Selection", MB_OK | MB_ICONINFORMATION);
                     }
                     break;
@@ -707,9 +1115,43 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     break;
                 }
                 
-                case ID_VIEW_ALL: {
+                case ID_VIEW_ALL:
+                case IDM_REFRESH: {
                     update_list_view(NULL);
                     SetWindowText(hwndStatus, "Showing all events");
+                    break;
+                }
+                
+                case ID_SEARCH:
+                case IDM_SEARCH: {
+                    GetWindowText(hwndSearchBox, g_search_filter, MAX_DESC);
+                    update_list_view(NULL);
+                    
+                    if (strlen(g_search_filter) > 0) {
+                        char msg[300];
+                        sprintf(msg, "Searching for: %s", g_search_filter);
+                        SetWindowText(hwndStatus, msg);
+                    } else {
+                        SetWindowText(hwndStatus, "Search cleared");
+                    }
+                    break;
+                }
+                
+                case ID_FILTER_CAT: {
+                    if (HIWORD(wParam) == CBN_SELCHANGE) {
+                        int sel = SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0);
+                        g_category_filter = sel - 1; // -1 for "All"
+                        update_list_view(NULL);
+                    }
+                    break;
+                }
+                
+                case ID_FILTER_PRI: {
+                    if (HIWORD(wParam) == CBN_SELCHANGE) {
+                        int sel = SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0);
+                        g_priority_filter = sel - 1; // -1 for "All"
+                        update_list_view(NULL);
+                    }
                     break;
                 }
                 
@@ -723,27 +1165,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     ofn.nMaxFile = MAX_PATH;
                     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
                     ofn.lpstrDefExt = "csv";
-                    ofn.lpstrTitle = "Export Events to CSV";
                     
                     if (GetSaveFileName(&ofn)) {
                         export_to_csv(filename);
-                        char msg[500];
-                        sprintf(msg, "Events successfully exported to:\n%s\n\n"
-                                    "You can now open this file in Excel or any spreadsheet application.",
-                               filename);
-                        MessageBox(hwnd, msg, "Export Successful", MB_OK | MB_ICONINFORMATION);
-                        
-                        char status[400];
-                        sprintf(status, "Exported to: %s", filename);
-                        SetWindowText(hwndStatus, status);
+                        MessageBox(hwnd, "Events exported successfully!", 
+                                 "Export Complete", MB_OK | MB_ICONINFORMATION);
                     }
                     break;
                 }
                 
+                case ID_BACKUP: {
+                    backup_data();
+                    break;
+                }
+                
                 case ID_STATS: {
-                    // Count statistics
                     int total = 0, priorities[4] = {0}, categories[8] = {0};
-                    int all_day = 0, recurring = 0, with_reminder = 0;
+                    int all_day = 0, with_reminder = 0; 
                     Event *e = event_list;
                     while (e) {
                         if (!e->deleted) {
@@ -751,7 +1189,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                             priorities[e->priority]++;
                             categories[e->category]++;
                             if (e->is_all_day) all_day++;
-                            if (e->recurrence != RECUR_NONE) recurring++;
                             if (e->reminder_minutes > 0) with_reminder++;
                         }
                         e = e->next;
@@ -759,30 +1196,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     
                     char stats[2000];
                     sprintf(stats, 
-                           "═══════════════════════════════════════════\n"
-                           "        CALENDAR STATISTICS"
-                           "═══════════════════════════════════════════\n\n"
-                           "   OVERVIEW:\n"
-                           "   Total Events: %d\n"
-                           "   All-Day Events: %d\n"
-                           "   Recurring Events: %d\n"
-                           "   Events with Reminders: %d\n\n"
+                           "===================================\n"
+                           "        CALENDAR STATISTICS\n"
+                           "===================================\n\n"
+                           "OVERVIEW:\n"
+                           "  Total Events: %d\n"
+                           "  All-Day Events: %d\n"
+                           "  Events with Reminders: %d\n\n"
                            "PRIORITY DISTRIBUTION:\n"
-                           "   Critical: %d\n"
-                           "   High: %d\n"
-                           "   Medium: %d\n"
-                           "   Low: %d\n\n"
+                           "  Critical: %d\n"
+                           "  High: %d\n"
+                           "  Medium: %d\n"
+                           "  Low: %d\n\n"
                            "CATEGORY DISTRIBUTION:\n"
-                           "   Work: %d\n"
-                           "   Personal: %d\n"
-                           "   Birthday: %d\n"
-                           "   Meeting: %d\n"
-                           "   Appointment: %d\n"
-                           "   Reminder: %d\n"
-                           "   Holiday: %d\n"
-                           "   Other: %d\n"
-                           "═══════════════════════════════════════════",
-                           total, all_day, recurring, with_reminder,
+                           "  Work: %d\n"
+                           "  Personal: %d\n"
+                           "  Birthday: %d\n"
+                           "  Meeting: %d\n"
+                           "  Appointment: %d\n"
+                           "  Reminder: %d\n"
+                           "  Holiday: %d\n"
+                           "  Other: %d\n",
+                           total, all_day, with_reminder,
                            priorities[PRIORITY_CRITICAL],
                            priorities[PRIORITY_HIGH],
                            priorities[PRIORITY_MEDIUM],
@@ -799,14 +1234,33 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     MessageBox(hwnd, stats, "Calendar Statistics", MB_OK | MB_ICONINFORMATION);
                     break;
                 }
+                
+                case ID_SEARCH_BOX: {
+                    if (HIWORD(wParam) == EN_CHANGE) {
+                        GetWindowText(hwndSearchBox, g_search_filter, MAX_DESC);
+                        update_list_view(NULL);
+                    }
+                    break;
+                }
+
+                case 9999: {
+                    debug_print_events();
+                    update_list_view(NULL);
+                    break;
+                }
             }
             return 0;
         }
         
         case WM_SIZE: {
-            // Resize status bar
             SendMessage(hwndStatus, WM_SIZE, 0, 0);
             return 0;
+        }
+        
+        case WM_CTLCOLORSTATIC: {
+            HDC hdcStatic = (HDC)wParam;
+            SetBkMode(hdcStatic, TRANSPARENT);
+            return (LRESULT)GetStockObject(NULL_BRUSH);
         }
         
         case WM_CLOSE: {
@@ -840,14 +1294,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-// ========== MAIN FUNCTION ==========
+// Main entry point
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     hInst = hInstance;
     
     // Initialize common controls
     INITCOMMONCONTROLSEX icex;
     icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
-    icex.dwICC = ICC_DATE_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_BAR_CLASSES;
+    icex.dwICC = ICC_DATE_CLASSES | ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES;
     InitCommonControlsEx(&icex);
     
     // Register main window class
@@ -858,7 +1312,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.lpszClassName = "CalendarManager";
+    wc.lpszClassName = "CalendarManagerEnhanced";
     wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     wc.hIconSm = LoadIcon(NULL, IDI_APPLICATION);
     
@@ -867,13 +1321,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 0;
     }
     
-    // Create main window
+    // Create main window with larger size for new features
     hwndMain = CreateWindowEx(
         0,
-        "CalendarManager",
-        "  Calendar Manager Pro - Windows Edition",
+        "CalendarManagerEnhanced",
+        "📅 Calendar Manager Pro - Enhanced Edition",
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 1200, 650,
+        CW_USEDEFAULT, CW_USEDEFAULT, 1220, 680,
         NULL, NULL, hInstance, NULL
     );
     
@@ -882,11 +1336,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 0;
     }
     
+    // Create accelerators for keyboard shortcuts
+    ACCEL accel[5];
+    accel[0].fVirt = FCONTROL | FVIRTKEY;
+    accel[0].key = 'N';
+    accel[0].cmd = IDM_NEW;
+    
+    accel[1].fVirt = FCONTROL | FVIRTKEY;
+    accel[1].key = 'E';
+    accel[1].cmd = IDM_EDIT;
+    
+    accel[2].fVirt = FVIRTKEY;
+    accel[2].key = VK_DELETE;
+    accel[2].cmd = IDM_DELETE;
+    
+    accel[3].fVirt = FCONTROL | FVIRTKEY;
+    accel[3].key = 'F';
+    accel[3].cmd = IDM_SEARCH;
+    
+    accel[4].fVirt = FVIRTKEY;
+    accel[4].key = VK_F5;
+    accel[4].cmd = IDM_REFRESH;
+    
+    HACCEL hAccel = CreateAcceleratorTable(accel, 5);
+    
     ShowWindow(hwndMain, nCmdShow);
     UpdateWindow(hwndMain);
     
     // Show welcome message
-    char welcome[500];
     Date today;
     get_today(&today);
     
@@ -897,27 +1374,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         e = e->next;
     }
     
-    sprintf(welcome, 
-           "Welcome to Calendar Manager Pro!\n\n"
-           "Today: %02d/%02d/%d\n"
-           "Total Events: %d\n\n"
-           "Features:\n"
-           "• Add, edit, and delete events\n"
-           "• Set priorities and categories\n"
-           "• Recurring events support\n"
-           "• Export to CSV\n"
-           "• Automatic save\n\n"
-           "Click on calendar dates to filter events!\n"
-           "All changes are saved automatically.",
-           today.day, today.month, today.year, event_count);
-    
-    MessageBox(hwndMain, welcome, "Welcome!", MB_OK | MB_ICONINFORMATION);
-    
-    // Message loop
+    // Message loop with accelerator support
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        if (!TranslateAccelerator(hwndMain, hAccel, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
     }
     
     return (int)msg.wParam;
