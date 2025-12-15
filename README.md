@@ -48,7 +48,7 @@ This enhanced edition introduces modern event management features such as **sear
 1. **Clone or Download the Repository**
 ```bash
 git clone https://github.com/Harshvardhan770/DSA-CP
-cd Calendar-Manager-Enhanced
+cd DSA-CP
 ````
 
 2. **Compile the Application**
