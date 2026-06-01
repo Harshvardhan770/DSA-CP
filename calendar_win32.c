@@ -6,6 +6,8 @@
 #include <string.h>
 #include <time.h>
 
+#define _WIN32_IE 0x0300
+
 #pragma comment(lib, "comctl32.lib")
 
 // ========== CONSTANTS ==========
